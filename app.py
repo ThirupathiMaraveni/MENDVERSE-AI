@@ -1,8 +1,9 @@
 import streamlit as st
-import ollama
 import json
 import re
 import sqlite3
+from google import genai
+from google.genai import types
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
@@ -482,7 +483,7 @@ header[data-testid="stHeader"] {
 # LOCAL AI VISION ENGINE — MENDVERSE 3.1
 # ==========================================
 
-VISION_MODEL = "qwen2.5vl:3b"
+VISION_MODEL = "gemini-3.5-flash"
 
 RISK_TERMS = (
     "battery", "swollen", "smoke", "burning", "sparking",
@@ -594,7 +595,7 @@ def classify_safety(object_name, problem, ai_result):
 
 def analyze_object_with_vision(object_name, problem, image_bytes):
     """
-    Analyse an uploaded image with the local Ollama vision model.
+    Analyse an uploaded image using Gemini cloud vision.
     Results are preliminary guidance, not a verified diagnosis.
     """
     prompt = f"""
@@ -646,43 +647,71 @@ STRICT RULES:
 - Keep the recommendations concise, conservative and practical.
 """
    # MENDVERSE: Independent object identification
-    identity_response = ollama.chat(
-        model=VISION_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Identify the main physical object visible in this "
-                    "photograph. Do not guess. Do not assume its identity. "
-                    "Do not describe an object that is not clearly visible. "
-                    "Return only the object's name and a short description. "
-                    "If uncertain, say UNKNOWN."
-                ),
-                "images": [image_bytes],
-            }
-        ],
-        options={"temperature": 0.0},
+    # MENDVERSE: Gemini cloud vision engine
+
+    api_key = st.secrets.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is missing from Streamlit secrets.")
+
+    client = genai.Client(api_key=api_key)
+
+    # Detect uploaded image format
+    with Image.open(BytesIO(image_bytes)) as image:
+        image_format = (image.format or "").upper()
+
+    mime_type = {
+        "JPEG": "image/jpeg",
+        "PNG": "image/png",
+        "WEBP": "image/webp"
+    }.get(image_format)
+
+    if not mime_type:
+        raise ValueError("Unsupported image format.")
+
+    image_part = types.Part.from_bytes(
+        data=image_bytes,
+        mime_type=mime_type
     )
 
-    independent_identity = (
-        identity_response.message.content.strip()
-    )
-    response = ollama.chat(
-        model=VISION_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-                "images": [image_bytes],
-            }
-        ],
-        format="json",
-        options={"temperature": 0.1},
+    # First AI call: independent object identification
+    identity_prompt = (
+        "Identify the main physical object visible in this photograph. "
+        "Do not guess or assume its identity. "
+        "Return only the object's name and a short description. "
+        "If uncertain, say UNKNOWN."
     )
 
-    raw_response = response.message.content.strip()
+    identity_response = client.models.generate_content(
+        model=VISION_MODEL,
+        contents=[identity_prompt, image_part],
+        config=types.GenerateContentConfig(
+            temperature=0.0
+        )
+    )
+
+    independent_identity = (identity_response.text or "").strip()
+
+    # Second AI call: structured object analysis
+    full_prompt = prompt + (
+        "\n\nIndependent visual identification result: "
+        + independent_identity
+        + "\nIndependently inspect the image and follow all verification rules."
+    )
+
+    response = client.models.generate_content(
+        model=VISION_MODEL,
+        contents=[full_prompt, image_part],
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json"
+        )
+    )
+
+    raw_response = (response.text or "").strip()
+
     try:
         result = json.loads(raw_response)
+
     except json.JSONDecodeError:
         result = {
             "object_seen": "Could not structure the model's response.",
@@ -692,11 +721,11 @@ STRICT RULES:
             "visible_damage": "Not reliably identified.",
             "possible_causes": "Unknown.",
             "visual_confidence": "low",
-            "repair": "Do not act on this response; retry with a clearer photograph.",
+            "repair": "Retry with a clearer photograph.",
             "reinvent": "Not assessed.",
-            "recover": "Check the object's materials and local authorised recycling options.",
-            "uncertainty": "The model response could not be parsed into the expected fields.",
-            "safety": "This image analysis cannot establish that an item is safe. Seek qualified help for hazardous items.",
+            "recover": "Check authorised recycling options.",
+            "uncertainty": "The model response could not be parsed.",
+            "safety": "Image analysis cannot establish that an item is safe."
         }
 
     required = [
@@ -1077,7 +1106,7 @@ elif page == "Analyze Object":
                     "date": datetime.now().strftime(
                         "%d %b %Y, %I:%M %p"
                     ),
-                    "engine": f"Local vision model: {VISION_MODEL}",
+                    "engine": f"Gemini Cloud Vision: {VISION_MODEL}",
                 }
 
                 # Persist the report and photograph in the local SQLite database.
@@ -1095,11 +1124,10 @@ elif page == "Analyze Object":
                 if "not found" in error_text.lower() or "pull" in error_text.lower():
                     st.error(
                         f"Vision model '{VISION_MODEL}' is not available. "
-                        f"In your project terminal, run: ollama pull {VISION_MODEL}"
-                    )
+                        "Please check your Gemini API configuration and model availability."                    )
                 elif "connect" in error_text.lower() or "connection" in error_text.lower():
                     st.error(
-                        "MENDVERSE cannot connect to Ollama. Open the Ollama "
+                        "MENDVERSE cannot connect to Gemini. Open the Gemini "
                         "application, wait a few seconds, and try again."
                     )
                 elif isinstance(error, (OSError, ValueError)):
@@ -1109,8 +1137,7 @@ elif page == "Analyze Object":
                     )
                 else:
                     st.error(
-                        "AI analysis failed. Check that Ollama is running "
-                        "and the qwen2.5vl:3b model is installed."
+                        "AI analysis failed.Please Check your Gemini API Key, internet connection, and model availability. "
                     )
                     st.caption(f"Technical detail: {error}")
 
