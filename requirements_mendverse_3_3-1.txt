@@ -1,0 +1,4 @@
+streamlit
+pillow
+ollama
+reportlab>=4.0
